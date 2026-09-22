@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import shutil
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -102,27 +103,37 @@ def save_hf_model_to_path(
     writer = _SafetensorShardWriter(path, enabled=is_writer_rank)
     pending_write = None
 
-    for chunk_idx, hf_named_tensors in enumerate(
-        hf_weight_iterator.get_hf_weight_chunks(
-            megatron_local_weights,
-            progress_desc=progress_desc,
-            # Megatron-to-HF conversion is stateful for some parameters.  For
-            # example, q_a_proj and kv_a_proj can land in adjacent chunks but
-            # must be emitted together for SGLang compatibility.  Every node
-            # writer therefore has to observe every chunk so that pairs can
-            # cross chunk boundaries.  Writers still only persist their
-            # modulo-assigned shards below; non-writer ranks skip conversion.
-            should_convert_chunk=lambda _idx: is_writer_rank,
-        )
-    ):
-        if is_writer_rank and chunk_idx % num_save_nodes == save_node_rank:
-            pending_write = (chunk_idx, hf_named_tensors)
-            hf_named_tensors = None
-        else:
-            del hf_named_tensors
+    if getattr(args, "nvfp4_qat", False):
+        from .nvfp4_qat import nvfp4_sync_family_amax
 
-        if (chunk_idx + 1) % num_save_nodes == 0:
-            pending_write = _write_pending_chunk(writer, pending_write)
+        nvfp4_sync_context = nvfp4_sync_family_amax(
+            megatron_local_weights.items(), args.nvfp4_qat_include, args.nvfp4_qat_exclude
+        )
+    else:
+        nvfp4_sync_context = nullcontext()
+
+    with nvfp4_sync_context:
+        for chunk_idx, hf_named_tensors in enumerate(
+            hf_weight_iterator.get_hf_weight_chunks(
+                megatron_local_weights,
+                progress_desc=progress_desc,
+                # Megatron-to-HF conversion is stateful for some parameters.  For
+                # example, q_a_proj and kv_a_proj can land in adjacent chunks but
+                # must be emitted together for SGLang compatibility.  Every node
+                # writer therefore has to observe every chunk so that pairs can
+                # cross chunk boundaries.  Writers still only persist their
+                # modulo-assigned shards below; non-writer ranks skip conversion.
+                should_convert_chunk=lambda _idx: is_writer_rank,
+            )
+        ):
+            if is_writer_rank and chunk_idx % num_save_nodes == save_node_rank:
+                pending_write = (chunk_idx, hf_named_tensors)
+                hf_named_tensors = None
+            else:
+                del hf_named_tensors
+
+            if (chunk_idx + 1) % num_save_nodes == 0:
+                pending_write = _write_pending_chunk(writer, pending_write)
 
     pending_write = _write_pending_chunk(writer, pending_write)
     _finalize_distributed_shards(path, writer.state())

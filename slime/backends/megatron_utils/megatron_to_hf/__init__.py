@@ -21,6 +21,12 @@ def convert_to_hf(args, model_name, name, param, quantization_config=None, trans
         return [(hf_name, param)]
 
     param = remove_padding(name, param, args.vocab_size)
+    if getattr(args, "nvfp4_qat", False):
+        # Before the HF split: Megatron's fused QKV / gate-up tensor carries the one tensor scale
+        # its projections share, and it is the tensor the trainer's forward quantizes.
+        from slime.backends.megatron_utils.nvfp4_qat import nvfp4_qdq_for_sync
+
+        param = nvfp4_qdq_for_sync(name, param, args.nvfp4_qat_include, args.nvfp4_qat_exclude)
     converted_named_tensors = _convert_to_hf_core(args, model_name, name, param)
 
     return quantize_params(args, name, converted_named_tensors, quantization_config, transform_ue8m0)

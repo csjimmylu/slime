@@ -257,6 +257,9 @@ def make_slime_validate_args(**overrides):
         update_weight_local_checkpoint_dir=None,
         update_weight_mode="full",
         rollout_temperature=1.0,
+        nvfp4_qat=False,
+        nvfp4_qat_include=None,
+        nvfp4_qat_exclude=[],
     )
     values.update(overrides)
     return types.SimpleNamespace(**values)
@@ -401,6 +404,66 @@ def test_force_fp8_ue8m0_scale_argument(monkeypatch):
 
     assert defaults.force_fp8_ue8m0_scale is False
     assert configured.force_fp8_ue8m0_scale is True
+
+
+@pytest.mark.unit
+def test_nvfp4_qat_arguments(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    parser = argparse.ArgumentParser()
+    module.get_slime_extra_args_provider()(parser)
+
+    defaults = parser.parse_args(["--rollout-batch-size", "1"])
+    configured = parser.parse_args(
+        ["--rollout-batch-size", "1", "--nvfp4-qat", "--nvfp4-qat-exclude", "self_attention", "shared_experts"]
+    )
+
+    assert defaults.nvfp4_qat is False
+    assert defaults.nvfp4_qat_include is None
+    assert defaults.nvfp4_qat_exclude == []
+    assert configured.nvfp4_qat is True
+    assert configured.nvfp4_qat_exclude == ["self_attention", "shared_experts"]
+
+
+@pytest.mark.unit
+def test_nvfp4_qat_requires_gradient_accumulation_fusion_off(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(nvfp4_qat=True, gradient_accumulation_fusion=True, fp8=None)
+
+    with pytest.raises(ValueError, match="--no-gradient-accumulation-fusion"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_nvfp4_qat_rejects_fp8_training(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(nvfp4_qat=True, gradient_accumulation_fusion=False, fp8="hybrid")
+
+    with pytest.raises(ValueError, match="FP8"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_nvfp4_qat_resolves_the_default_include_patterns(monkeypatch):
+    from slime.backends.megatron_utils.nvfp4_qat import DEFAULT_INCLUDE
+
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(nvfp4_qat=True, gradient_accumulation_fusion=False, fp8=None)
+
+    module.slime_validate_args(args)
+
+    assert args.nvfp4_qat_include == list(DEFAULT_INCLUDE)
+
+
+@pytest.mark.unit
+def test_nvfp4_qat_keeps_explicit_include_patterns(monkeypatch):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        nvfp4_qat=True, gradient_accumulation_fusion=False, fp8=None, nvfp4_qat_include=[r"mlp\.experts"]
+    )
+
+    module.slime_validate_args(args)
+
+    assert args.nvfp4_qat_include == [r"mlp\.experts"]
 
 
 if __name__ == "__main__":

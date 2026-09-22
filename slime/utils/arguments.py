@@ -129,6 +129,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "packing remains controlled by the rollout runtime requirements."
                 ),
             )
+            parser.add_argument(
+                "--nvfp4-qat",
+                action="store_true",
+                default=False,
+                help=(
+                    "NVFP4 W4A16 fake-quant QAT: the actor's forward uses Q(w) with a straight-through "
+                    "backward into the high-precision weights, and weight sync sends the same Q(w) to "
+                    "the rollout engine as BF16. Requires --no-gradient-accumulation-fusion."
+                ),
+            )
+            parser.add_argument(
+                "--nvfp4-qat-include",
+                type=str,
+                nargs="+",
+                default=None,
+                help=(
+                    "Regexes over Megatron module names selecting the linears to quantize. Defaults to "
+                    "every decoder-layer linear except the MoE router (nvfp4_qat.DEFAULT_INCLUDE)."
+                ),
+            )
+            parser.add_argument(
+                "--nvfp4-qat-exclude",
+                type=str,
+                nargs="*",
+                default=[],
+                help="Regexes over Megatron module names removed from --nvfp4-qat-include.",
+            )
             # Delta weight sync.
             parser.add_argument(
                 "--update-weight-mode",
@@ -1777,6 +1804,18 @@ def slime_validate_args(args):
         raise ValueError(
             "--rollout-temperature must be > 0; temperature 0 is greedy decoding and is not a valid RL policy."
         )
+
+    if args.nvfp4_qat:
+        if args.gradient_accumulation_fusion:
+            # With fusion on, Transformer Engine writes wgrad straight into main_grad and skips
+            # autograd, so the masked straight-through estimator would silently never run.
+            raise ValueError("--nvfp4-qat requires --no-gradient-accumulation-fusion.")
+        if args.fp8:
+            raise ValueError("--nvfp4-qat fake-quantizes BF16 weights and cannot be combined with FP8 training.")
+        if args.nvfp4_qat_include is None:
+            from slime.backends.megatron_utils.nvfp4_qat import DEFAULT_INCLUDE
+
+            args.nvfp4_qat_include = list(DEFAULT_INCLUDE)
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):

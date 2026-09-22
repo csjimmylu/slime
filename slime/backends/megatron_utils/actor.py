@@ -91,6 +91,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
         dist.barrier(group=get_gloo_group())
 
+        if getattr(args, "nvfp4_qat", False) and getattr(self.hf_config, "quantization_config", None) is not None:
+            raise ValueError(
+                "--nvfp4-qat syncs fake-quantized BF16 weights and needs a BF16 --hf-checkpoint, but "
+                f"{args.hf_checkpoint} has a quantization_config."
+            )
+
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
@@ -270,7 +276,16 @@ class MegatronTrainRayActor(TrainRayActor):
         if target_tag not in self.weights_backuper.backup_tags:
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
         self.weights_backuper.restore(target_tag)
-        self._active_model_tag = target_tag
+        self._set_active_model_tag(target_tag)
+
+    def _set_active_model_tag(self, model_tag: str) -> None:
+        self._active_model_tag = model_tag
+        if getattr(self.args, "nvfp4_qat", False):
+            from .nvfp4_qat import set_nvfp4_qat_enabled
+
+            # ref and teacher weights are swapped into the one model the QAT hooks live on. They are
+            # high-precision anchors; every other tag is a snapshot of the quantized policy.
+            set_nvfp4_qat_enabled(model_tag not in ("ref", "teacher"))
 
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
@@ -604,7 +619,19 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
-            self.weight_updater.update_weights()
+            if getattr(self.args, "nvfp4_qat", False):
+                from .nvfp4_qat import nvfp4_sync_family_amax
+
+                # Built from the same snapshot the updater reads, so trainer and rollout share amaxes.
+                nvfp4_sync_context = nvfp4_sync_family_amax(
+                    self.weights_backuper.get("actor").items(),
+                    self.args.nvfp4_qat_include,
+                    self.args.nvfp4_qat_exclude,
+                )
+            else:
+                nvfp4_sync_context = nullcontext()
+            with nvfp4_sync_context:
+                self.weight_updater.update_weights()
             print_memory("after update_weights")
 
             if getattr(self.args, "keep_old_actor", False):
@@ -656,4 +683,4 @@ class MegatronTrainRayActor(TrainRayActor):
         ) = old_args
 
         self.weights_backuper.backup(model_tag)
-        self._active_model_tag = model_tag
+        self._set_active_model_tag(model_tag)

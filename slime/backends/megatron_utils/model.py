@@ -292,6 +292,15 @@ def setup_model_and_optimizer(
 
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
+    if role == "actor" and getattr(args, "nvfp4_qat", False):
+        from .nvfp4_qat import install_nvfp4_qat, megatron_amax_group
+
+        for model_chunk in model:
+            installed = install_nvfp4_qat(
+                model_chunk, args.nvfp4_qat_include, args.nvfp4_qat_exclude, amax_group=megatron_amax_group
+            )
+            logger.info(f"NVFP4 QAT installed on {len(installed)} linears, e.g. {installed[:3]}")
+
     if args.num_rollout == 0:
         args.no_load_optim = True
         return model, None, None
